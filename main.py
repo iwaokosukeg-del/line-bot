@@ -44,7 +44,7 @@ app = FastAPI()
 async def call_claude(user_message: str) -> str:
     """Claude API を呼び出して回答を生成する。"""
     params: dict = {
-        "model": "claude-opus-4-7",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1024,
         "messages": [{"role": "user", "content": user_message}],
     }
