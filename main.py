@@ -11,7 +11,7 @@ from linebot.v3.messaging import (
     AsyncApiClient,
     AsyncMessagingApi,
     Configuration,
-    ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
@@ -103,17 +103,17 @@ async def webhook(request: Request):
                 continue
 
             user_text = event.message.text
-            reply_token = event.reply_token
+            user_id = event.source.user_id
 
             try:
                 answer = await call_claude(user_text)
             except Exception as e:
                 answer = f"申し訳ありません、エラーが発生しました。\n{e}"
 
-            # LINE ユーザーに返信
-            await line_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
+            # LINE ユーザーに返信（push_message はreply token不要）
+            await line_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
                     messages=[TextMessage(text=answer)],
                 )
             )
