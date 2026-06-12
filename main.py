@@ -110,21 +110,23 @@ async def webhook(request: Request):
             except Exception as e:
                 answer = f"申し訳ありません、エラーが発生しました。\n{e}"
 
-            # LINE ユーザーに返信（push_message はreply token不要）
-            await line_api.push_message(
-                PushMessageRequest(
-                    to=user_id,
-                    messages=[TextMessage(text=answer)],
-                )
-            )
-
-            # 【要確認】が含まれる場合は Chatwork に通知
-            if "【要確認】" in answer:
+            # 【要確認】が含まれる場合は Chatwork に通知（元の回答で）
+            needs_review = "【要確認】" in answer
+            if needs_review:
                 try:
                     await notify_chatwork(user_text, answer)
                 except Exception as e:
                     # 通知失敗はログに残すが LINE 返信には影響させない
                     print(f"Chatwork 通知エラー: {e}")
+
+            # LINE ユーザーに返信（【要確認】タグは除去して送る）
+            line_answer = answer.replace("【要確認】", "").strip()
+            await line_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=line_answer)],
+                )
+            )
 
     return JSONResponse(content={"status": "ok"})
 
