@@ -15,7 +15,13 @@ from linebot.v3.messaging import (
     PushMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import (
+    FileMessageContent,
+    ImageMessageContent,
+    MessageEvent,
+    TextMessageContent,
+    VideoMessageContent,
+)
 
 import anthropic
 from dotenv import load_dotenv
@@ -44,6 +50,19 @@ app = FastAPI()
 # ユーザーIDをキーとして直近10件のやり取りを保持する
 MAX_HISTORY = 10
 conversation_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY * 2))
+
+# 画像・動画・ファイル受信時の固定返信
+DRAFT_SUBMISSION_REPLY = (
+    "ご提出いただきありがとうございます😊\n"
+    "内容を確認のうえ、担当者より改めてご連絡いたします🙇‍♀️"
+)
+
+# テキスト以外のメッセージ種別と日本語ラベルの対応
+NON_TEXT_MESSAGE_TYPES = {
+    ImageMessageContent: "画像",
+    VideoMessageContent: "動画",
+    FileMessageContent: "ファイル",
+}
 
 
 async def call_claude(user_id: str, user_message: str) -> str:
@@ -74,6 +93,36 @@ async def call_claude(user_id: str, user_message: str) -> str:
             return block.text
 
     return ""
+
+
+def format_history_for_chatwork(history: deque) -> str:
+    """直近の会話履歴（3往復分）を Chatwork 通知用に整形する。"""
+    recent = list(history)[-6:]  # 3往復 = ユーザー3件 + Bot3件
+    if not recent:
+        return "（履歴なし）"
+
+    lines = []
+    for entry in recent:
+        speaker = "ユーザー" if entry["role"] == "user" else "Bot"
+        lines.append(f"{speaker}: {entry['content']}")
+    return "\n".join(lines)
+
+
+async def notify_chatwork_draft(user_id: str, message_type_label: str, history: deque) -> None:
+    """画像・動画・ファイルの下書き提出を Chatwork に通知する。"""
+    history_text = format_history_for_chatwork(history)
+    body = (
+        "[info][title]【下書き提出】確認依頼[/title]"
+        f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
+        f"[b]メッセージ種別:[/b]\n{message_type_label}\n\n"
+        f"[b]直近の会話履歴（3往復分）:[/b]\n{history_text}[/info]"
+    )
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
+    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, data={"body": body})
+        resp.raise_for_status()
 
 
 async def notify_chatwork(user_message: str, answer: str) -> None:
@@ -107,36 +156,66 @@ async def webhook(request: Request):
         for event in events:
             if not isinstance(event, MessageEvent):
                 continue
-            if not isinstance(event.message, TextMessageContent):
-                continue
 
-            user_text = event.message.text
+            message = event.message
             user_id = event.source.user_id
 
-            try:
-                answer = await call_claude(user_id, user_text)
-                conversation_history[user_id].append({"role": "user", "content": user_text})
-                conversation_history[user_id].append({"role": "assistant", "content": answer})
-            except Exception as e:
-                answer = f"申し訳ありません、エラーが発生しました。\n{e}"
+            if isinstance(message, TextMessageContent):
+                user_text = message.text
 
-            # 【要確認】が含まれる場合は Chatwork に通知（元の回答で）
-            needs_review = "【要確認】" in answer
-            if needs_review:
                 try:
-                    await notify_chatwork(user_text, answer)
+                    answer = await call_claude(user_id, user_text)
+                    conversation_history[user_id].append({"role": "user", "content": user_text})
+                    conversation_history[user_id].append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    answer = f"申し訳ありません、エラーが発生しました。\n{e}"
+
+                # 【要確認】が含まれる場合は Chatwork に通知（元の回答で）
+                needs_review = "【要確認】" in answer
+                if needs_review:
+                    try:
+                        await notify_chatwork(user_text, answer)
+                    except Exception as e:
+                        # 通知失敗はログに残すが LINE 返信には影響させない
+                        print(f"Chatwork 通知エラー: {e}")
+
+                # LINE ユーザーに返信（【要確認】タグは除去して送る）
+                line_answer = answer.replace("【要確認】", "").strip()
+                await line_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text=line_answer)],
+                    )
+                )
+
+            elif type(message) in NON_TEXT_MESSAGE_TYPES:
+                # 画像・動画・ファイル：Claude API は呼ばず、固定文で返信し、必ず Chatwork に通知する
+                message_type_label = NON_TEXT_MESSAGE_TYPES[type(message)]
+                marker_text = f"（{message_type_label}を送信）"
+
+                # 文脈が途切れないよう会話履歴にも記録する
+                conversation_history[user_id].append({"role": "user", "content": marker_text})
+                conversation_history[user_id].append(
+                    {"role": "assistant", "content": DRAFT_SUBMISSION_REPLY}
+                )
+
+                try:
+                    await notify_chatwork_draft(
+                        user_id, message_type_label, conversation_history[user_id]
+                    )
                 except Exception as e:
                     # 通知失敗はログに残すが LINE 返信には影響させない
                     print(f"Chatwork 通知エラー: {e}")
 
-            # LINE ユーザーに返信（【要確認】タグは除去して送る）
-            line_answer = answer.replace("【要確認】", "").strip()
-            await line_api.push_message(
-                PushMessageRequest(
-                    to=user_id,
-                    messages=[TextMessage(text=line_answer)],
+                await line_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text=DRAFT_SUBMISSION_REPLY)],
+                    )
                 )
-            )
+
+            else:
+                continue
 
     return JSONResponse(content={"status": "ok"})
 
