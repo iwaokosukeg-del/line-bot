@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict, deque
 from pathlib import Path
 
 import httpx
@@ -40,13 +41,20 @@ claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 app = FastAPI()
 
+# ユーザーIDをキーとして直近10件のやり取りを保持する
+MAX_HISTORY = 10
+conversation_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY * 2))
 
-async def call_claude(user_message: str) -> str:
+
+async def call_claude(user_id: str, user_message: str) -> str:
     """Claude API を呼び出して回答を生成する。"""
+    history = conversation_history[user_id]
+    messages = list(history) + [{"role": "user", "content": user_message}]
+
     params: dict = {
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1024,
-        "messages": [{"role": "user", "content": user_message}],
+        "messages": messages,
     }
 
     if system_prompt:
@@ -106,7 +114,9 @@ async def webhook(request: Request):
             user_id = event.source.user_id
 
             try:
-                answer = await call_claude(user_text)
+                answer = await call_claude(user_id, user_text)
+                conversation_history[user_id].append({"role": "user", "content": user_text})
+                conversation_history[user_id].append({"role": "assistant", "content": answer})
             except Exception as e:
                 answer = f"申し訳ありません、エラーが発生しました。\n{e}"
 
