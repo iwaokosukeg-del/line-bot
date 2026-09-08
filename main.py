@@ -33,6 +33,7 @@ LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHATWORK_API_TOKEN = os.environ["CHATWORK_API_TOKEN"]
 CHATWORK_ROOM_ID = os.environ["CHATWORK_ROOM_ID"]
+CHATWORK_MENTION = os.environ.get("CHATWORK_MENTION", "")
 
 # システムプロンプトを読み込む
 _prompt_path = Path("system_prompt.txt")
@@ -97,22 +98,44 @@ async def call_claude(user_id: str, user_message: str) -> str:
 
 def format_history_for_chatwork(history: deque) -> str:
     """直近の会話履歴（3往復分）を Chatwork 通知用に整形する。"""
-    recent = list(history)[-6:]  # 3往復 = ユーザー3件 + Bot3件
+    recent = list(history)[-6:]  # 3往復 = ユーザー3件 + 愛子3件
     if not recent:
         return "（履歴なし）"
 
     lines = []
     for entry in recent:
-        speaker = "ユーザー" if entry["role"] == "user" else "Bot"
+        speaker = "ユーザー" if entry["role"] == "user" else "愛子"
         lines.append(f"{speaker}: {entry['content']}")
     return "\n".join(lines)
+
+
+def build_mention_prefix() -> str:
+    """CHATWORK_MENTION（"アカウントID:名前" のカンマ区切り）からメンション文字列を組み立てる。"""
+    if not CHATWORK_MENTION:
+        return ""
+
+    mentions = []
+    for entry in CHATWORK_MENTION.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        account_id, name = entry.split(":", 1)
+        account_id = account_id.strip()
+        name = name.strip()
+        if account_id and name:
+            mentions.append(f"[To:{account_id}]{name}さん")
+
+    if not mentions:
+        return ""
+    return "".join(mentions) + "\n"
 
 
 async def notify_chatwork_draft(user_id: str, message_type_label: str, history: deque) -> None:
     """画像・動画・ファイルの下書き提出を Chatwork に通知する。"""
     history_text = format_history_for_chatwork(history)
     body = (
-        "[info][title]【下書き提出】確認依頼[/title]"
+        build_mention_prefix()
+        + "[info][title]【下書き提出】確認依頼[/title]"
         f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
         f"[b]メッセージ種別:[/b]\n{message_type_label}\n\n"
         f"[b]直近の会話履歴（3往復分）:[/b]\n{history_text}[/info]"
@@ -128,7 +151,8 @@ async def notify_chatwork_draft(user_id: str, message_type_label: str, history: 
 async def notify_chatwork(user_message: str, answer: str) -> None:
     """Chatwork の指定ルームにエスカレーション通知を送る。"""
     body = (
-        "[info][title]【要確認】エスカレーション通知[/title]"
+        build_mention_prefix()
+        + "[info][title]【要確認】エスカレーション通知[/title]"
         f"[b]ユーザーメッセージ:[/b]\n{user_message}\n\n"
         f"[b]AI回答:[/b]\n{answer}[/info]"
     )

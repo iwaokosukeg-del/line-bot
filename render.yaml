@@ -15,3 +15,5 @@ services:
         sync: false
       - key: CHATWORK_ROOM_ID
         sync: false
+      - key: CHATWORK_MENTION
+        sync: false
