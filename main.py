@@ -1,6 +1,8 @@
 import os
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -65,6 +67,35 @@ NON_TEXT_MESSAGE_TYPES = {
     FileMessageContent: "ファイル",
 }
 
+JST = ZoneInfo("Asia/Tokyo")
+WEEKDAY_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+# コード側で確実に検知し、AIの判定に関わらず必ずChatwork通知するキーワード
+ESCALATION_KEYWORDS = [
+    "辞退", "お断り", "キャンセル", "やめたい", "取りやめ", "降りたい", "続けられない",
+    "返品", "返送", "解約", "かぶれ", "かゆい", "かゆみ", "赤み", "腫れ", "ヒリヒリ", "ピリピリ",
+    "肌荒れ", "湿疹", "発疹", "体調不良", "病院", "受診", "苦情", "クレーム", "不満",
+    "がっかり", "ひどい", "最悪", "二度と", "返金", "損害", "責任", "訴え",
+]
+
+
+def detect_escalation_keywords(text: str) -> list[str]:
+    """テキストに含まれるエスカレーション対象キーワードを検出する。"""
+    return [keyword for keyword in ESCALATION_KEYWORDS if keyword in text]
+
+
+def build_date_notice() -> str:
+    """日本時間の現在日時（今日・明日）をシステムプロンプトに追記する文字列を生成する。"""
+    now = datetime.now(JST)
+    tomorrow = now + timedelta(days=1)
+    today_str = f"{now.year}年{now.month}月{now.day}日（{WEEKDAY_JA[now.weekday()]}）"
+    tomorrow_str = f"{tomorrow.year}年{tomorrow.month}月{tomorrow.day}日（{WEEKDAY_JA[tomorrow.weekday()]}）"
+    return (
+        "\n\n【現在日時】\n"
+        f"今日は {today_str} です。\n"
+        f"明日は {tomorrow_str} です。"
+    )
+
 
 async def call_claude(user_id: str, user_message: str) -> str:
     """Claude API を呼び出して回答を生成する。"""
@@ -82,7 +113,7 @@ async def call_claude(user_id: str, user_message: str) -> str:
         params["system"] = [
             {
                 "type": "text",
-                "text": system_prompt,
+                "text": system_prompt + build_date_notice(),
                 "cache_control": {"type": "ephemeral"},
             }
         ]
@@ -164,6 +195,25 @@ async def notify_chatwork(user_message: str, answer: str) -> None:
         resp.raise_for_status()
 
 
+async def notify_chatwork_keyword_escalation(
+    user_message: str, answer: str, matched_keywords: list[str]
+) -> None:
+    """辞退・クレーム等のキーワードを検知した際、AIの判定に関わらず Chatwork に通知する。"""
+    body = (
+        build_mention_prefix()
+        + "[info][title]【緊急】要対応キーワード検知[/title]"
+        f"[b]検知ワード:[/b] {', '.join(matched_keywords)}\n\n"
+        f"[b]ユーザーメッセージ:[/b]\n{user_message}\n\n"
+        f"[b]AI回答:[/b]\n{answer}[/info]"
+    )
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
+    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, data={"body": body})
+        resp.raise_for_status()
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
@@ -194,9 +244,17 @@ async def webhook(request: Request):
                 except Exception as e:
                     answer = f"申し訳ありません、エラーが発生しました。\n{e}"
 
-                # 【要確認】が含まれる場合は Chatwork に通知（元の回答で）
+                # 辞退・クレーム等のキーワードを検知した場合は、AIの判定に関わらず必ず通知する
+                # （キーワード検知と【要確認】の両方に該当する場合は、キーワード検知を優先し重複通知しない）
+                matched_keywords = detect_escalation_keywords(user_text)
                 needs_review = "【要確認】" in answer
-                if needs_review:
+                if matched_keywords:
+                    try:
+                        await notify_chatwork_keyword_escalation(user_text, answer, matched_keywords)
+                    except Exception as e:
+                        # 通知失敗はログに残すが LINE 返信には影響させない
+                        print(f"Chatwork 通知エラー: {e}")
+                elif needs_review:
                     try:
                         await notify_chatwork(user_text, answer)
                     except Exception as e:
