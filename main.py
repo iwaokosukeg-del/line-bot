@@ -15,6 +15,7 @@ from linebot.v3.messaging import (
     AsyncMessagingApi,
     Configuration,
     PushMessageRequest,
+    ReplyMessageRequest,
     TextMessage,
 )
 from linebot.v3.webhooks import (
@@ -214,6 +215,54 @@ async def notify_chatwork_keyword_escalation(
         resp.raise_for_status()
 
 
+async def notify_chatwork_line_failure(user_id: str, content: str, error: str) -> None:
+    """LINE送信が失敗した場合に Chatwork へ通知する。"""
+    body = (
+        build_mention_prefix()
+        + "[info][title]【システムエラー】LINE送信失敗[/title]"
+        f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
+        f"[b]送信予定内容:[/b]\n{content}\n\n"
+        f"[b]エラー内容:[/b]\n{error}[/info]"
+    )
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
+    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, data={"body": body})
+        resp.raise_for_status()
+
+
+async def send_line_reply(
+    line_api: AsyncMessagingApi, reply_token: str, user_id: str, text: str
+) -> None:
+    """LINE へ返信する。reply_message を優先し、失敗した場合のみ push_message にフォールバックする。"""
+    reply_error_message = None
+    try:
+        await line_api.reply_message(
+            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
+        )
+        return
+    except Exception as reply_error:
+        reply_error_message = str(reply_error)
+        print(f"LINE reply_message 失敗（user_id={user_id}）: {reply_error_message}")
+
+    try:
+        await line_api.push_message(
+            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+        )
+    except Exception as push_error:
+        push_error_message = str(push_error)
+        print(f"LINE push_message フォールバックも失敗（user_id={user_id}）: {push_error_message}")
+        error_detail = (
+            f"reply_message エラー: {reply_error_message}\n"
+            f"push_message エラー: {push_error_message}"
+        )
+        try:
+            await notify_chatwork_line_failure(user_id, text, error_detail)
+        except Exception as notify_error:
+            print(f"Chatwork 通知エラー: {notify_error}")
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
@@ -263,12 +312,7 @@ async def webhook(request: Request):
 
                 # LINE ユーザーに返信（【要確認】タグは除去して送る）
                 line_answer = answer.replace("【要確認】", "").strip()
-                await line_api.push_message(
-                    PushMessageRequest(
-                        to=user_id,
-                        messages=[TextMessage(text=line_answer)],
-                    )
-                )
+                await send_line_reply(line_api, event.reply_token, user_id, line_answer)
 
             elif type(message) in NON_TEXT_MESSAGE_TYPES:
                 # 画像・動画・ファイル：Claude API は呼ばず、固定文で返信し、必ず Chatwork に通知する
@@ -289,12 +333,7 @@ async def webhook(request: Request):
                     # 通知失敗はログに残すが LINE 返信には影響させない
                     print(f"Chatwork 通知エラー: {e}")
 
-                await line_api.push_message(
-                    PushMessageRequest(
-                        to=user_id,
-                        messages=[TextMessage(text=DRAFT_SUBMISSION_REPLY)],
-                    )
-                )
+                await send_line_reply(line_api, event.reply_token, user_id, DRAFT_SUBMISSION_REPLY)
 
             else:
                 continue
