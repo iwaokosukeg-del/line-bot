@@ -151,10 +151,21 @@ def _fetch_stop_list_rows_sync() -> list[dict]:
     return rows
 
 
-def _add_stop_row_sync(user_id: str, reason: str) -> None:
+def _upsert_stop_row_sync(user_id: str, reason: str) -> bool:
+    """停止リストに行を追加、または既存行があれば停止日時・理由のみ更新する。
+
+    戻り値は「追加前から既に停止リストに存在していたか」。
+    """
     worksheet = _get_stop_list_worksheet()
     stopped_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+    cell = worksheet.find(user_id, in_column=1)
+    if cell is not None:
+        worksheet.update([[stopped_at, reason]], f"D{cell.row}:E{cell.row}")
+        return True
+
     worksheet.append_row([user_id, "", "", stopped_at, reason])
+    return False
 
 
 def _remove_stop_row_sync(user_id: str) -> bool:
@@ -164,6 +175,27 @@ def _remove_stop_row_sync(user_id: str) -> bool:
         return False
     worksheet.delete_rows(cell.row)
     return True
+
+
+def _dedupe_stop_list_rows_sync() -> None:
+    """同一LINE USER IDの重複行を整理し、最後（最新）の1行だけを残す。"""
+    worksheet = _get_stop_list_worksheet()
+    values = worksheet.get_all_values()
+
+    last_row_by_user: dict[str, int] = {}
+    for row_number, row in enumerate(values[1:], start=2):
+        if not row or not row[0].strip():
+            continue
+        last_row_by_user[row[0].strip()] = row_number
+
+    rows_to_delete = [
+        row_number
+        for row_number, row in enumerate(values[1:], start=2)
+        if row and row[0].strip() and last_row_by_user[row[0].strip()] != row_number
+    ]
+
+    for row_number in sorted(rows_to_delete, reverse=True):
+        worksheet.delete_rows(row_number)
 
 
 async def refresh_stop_list() -> None:
@@ -211,9 +243,12 @@ async def notify_chatwork_ai_stopped(user_id: str, received_text: str, reason: s
 
 async def handle_stop_command(user_id: str, reason: str) -> None:
     try:
-        await asyncio.to_thread(_add_stop_row_sync, user_id, reason)
+        already_stopped = await asyncio.to_thread(_upsert_stop_row_sync, user_id, reason)
         await refresh_stop_list()
-        await post_to_chatwork(f"AI応答を停止しました：{user_id}")
+        if already_stopped:
+            await post_to_chatwork(f"すでに停止中です：{user_id}")
+        else:
+            await post_to_chatwork(f"AI応答を停止しました：{user_id}")
     except Exception as e:
         print(f"停止コマンドの処理に失敗しました（user_id={user_id}）: {e}")
         try:
@@ -229,7 +264,7 @@ async def handle_resume_command(user_id: str) -> None:
         if removed:
             await post_to_chatwork(f"AI応答を再開しました：{user_id}")
         else:
-            await post_to_chatwork(f"停止リストに {user_id} は見つかりませんでした。")
+            await post_to_chatwork(f"停止リストに登録されていません：{user_id}")
     except Exception as e:
         print(f"再開コマンドの処理に失敗しました（user_id={user_id}）: {e}")
         try:
@@ -278,8 +313,38 @@ async def chatwork_command_loop() -> None:
         await asyncio.sleep(CHATWORK_COMMAND_POLL_INTERVAL_SECONDS)
 
 
+async def seed_processed_chatwork_message_ids() -> None:
+    """起動時点でChatworkルームに存在する既存メッセージを「処理済み」として記録する。
+
+    これにより、起動前に投稿された古い停止・再開コマンドを実行してしまうことを防ぐ。
+    """
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages?force=1"
+    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            messages = resp.json()
+    except Exception as e:
+        print(f"Chatworkメッセージの初期読み込みに失敗しました: {e}")
+        return
+
+    for message in messages:
+        message_id = str(message.get("message_id", ""))
+        if message_id:
+            processed_chatwork_message_ids.add(message_id)
+
+
 @app.on_event("startup")
 async def start_background_tasks() -> None:
+    try:
+        await asyncio.to_thread(_dedupe_stop_list_rows_sync)
+    except Exception as e:
+        print(f"停止リストの重複行整理に失敗しました: {e}")
+
+    await seed_processed_chatwork_message_ids()
+
     asyncio.create_task(refresh_stop_list_loop())
     asyncio.create_task(chatwork_command_loop())
 
