@@ -94,7 +94,7 @@ def detect_escalation_keywords(text: str) -> list[str]:
 
 # --- AI自動応答の停止機能 -----------------------------------------------
 # 停止対象ユーザーはGoogleスプレッドシートで管理する。
-# 1行目ヘッダー、A列:LINE USER ID / B列:氏名・メモ / C列:停止日時 / D列:停止理由
+# 1行目ヘッダー、A列:LINE USER ID / B列:氏名 / C列:メモ / D列:停止日時 / E列:停止理由
 
 STOP_LIST_REFRESH_INTERVAL_SECONDS = 60
 CHATWORK_COMMAND_POLL_INTERVAL_SECONDS = 60
@@ -129,7 +129,10 @@ def _get_stop_list_worksheet():
 
 
 def _fetch_stop_list_rows_sync() -> list[dict]:
-    """スプレッドシートから停止リストの行を同期的に取得する（ブロッキング処理）。"""
+    """スプレッドシートから停止リストの行を同期的に取得する（ブロッキング処理）。
+
+    停止対象かどうかの判定にはA列のLINE USER IDのみを参照する。
+    """
     worksheet = _get_stop_list_worksheet()
     values = worksheet.get_all_values()
     rows = []
@@ -140,8 +143,9 @@ def _fetch_stop_list_rows_sync() -> list[dict]:
             {
                 "user_id": row[0].strip(),
                 "name": row[1].strip() if len(row) > 1 else "",
-                "stopped_at": row[2].strip() if len(row) > 2 else "",
-                "reason": row[3].strip() if len(row) > 3 else "",
+                "memo": row[2].strip() if len(row) > 2 else "",
+                "stopped_at": row[3].strip() if len(row) > 3 else "",
+                "reason": row[4].strip() if len(row) > 4 else "",
             }
         )
     return rows
@@ -150,7 +154,7 @@ def _fetch_stop_list_rows_sync() -> list[dict]:
 def _add_stop_row_sync(user_id: str, reason: str) -> None:
     worksheet = _get_stop_list_worksheet()
     stopped_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    worksheet.append_row([user_id, "", stopped_at, reason])
+    worksheet.append_row([user_id, "", "", stopped_at, reason])
 
 
 def _remove_stop_row_sync(user_id: str) -> bool:
