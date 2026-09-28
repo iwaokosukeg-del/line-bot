@@ -1,10 +1,15 @@
+import asyncio
+import json
 import os
+import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import gspread
 import httpx
+from google.oauth2.service_account import Credentials as GoogleServiceAccountCredentials
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -37,6 +42,8 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHATWORK_API_TOKEN = os.environ["CHATWORK_API_TOKEN"]
 CHATWORK_ROOM_ID = os.environ["CHATWORK_ROOM_ID"]
 CHATWORK_MENTION = os.environ.get("CHATWORK_MENTION", "")
+GOOGLE_SHEETS_CREDENTIALS = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 
 # システムプロンプトを読み込む
 _prompt_path = Path("system_prompt.txt")
@@ -83,6 +90,194 @@ ESCALATION_KEYWORDS = [
 def detect_escalation_keywords(text: str) -> list[str]:
     """テキストに含まれるエスカレーション対象キーワードを検出する。"""
     return [keyword for keyword in ESCALATION_KEYWORDS if keyword in text]
+
+
+# --- AI自動応答の停止機能 -----------------------------------------------
+# 停止対象ユーザーはGoogleスプレッドシートで管理する。
+# 1行目ヘッダー、A列:LINE USER ID / B列:氏名・メモ / C列:停止日時 / D列:停止理由
+
+STOP_LIST_REFRESH_INTERVAL_SECONDS = 60
+CHATWORK_COMMAND_POLL_INTERVAL_SECONDS = 60
+
+# user_id -> {"name": str, "stopped_at": str, "reason": str}
+stopped_users: dict[str, dict] = {}
+
+# 二重処理防止用に処理済みのChatworkメッセージIDを記録する
+processed_chatwork_message_ids: set[str] = set()
+
+STOP_COMMAND_RE = re.compile(r"^停止\s+(\S+)(?:\s+(.+))?$", re.DOTALL)
+RESUME_COMMAND_RE = re.compile(r"^再開\s+(\S+)\s*$", re.DOTALL)
+
+_gspread_client = None
+
+
+def _get_gspread_client():
+    """gspreadクライアントを生成（初回のみ）してキャッシュする。"""
+    global _gspread_client
+    if _gspread_client is None:
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+        credentials = GoogleServiceAccountCredentials.from_service_account_info(
+            creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        _gspread_client = gspread.authorize(credentials)
+    return _gspread_client
+
+
+def _get_stop_list_worksheet():
+    client = _get_gspread_client()
+    return client.open_by_key(SPREADSHEET_ID).sheet1
+
+
+def _fetch_stop_list_rows_sync() -> list[dict]:
+    """スプレッドシートから停止リストの行を同期的に取得する（ブロッキング処理）。"""
+    worksheet = _get_stop_list_worksheet()
+    values = worksheet.get_all_values()
+    rows = []
+    for row in values[1:]:
+        if not row or not row[0].strip():
+            continue
+        rows.append(
+            {
+                "user_id": row[0].strip(),
+                "name": row[1].strip() if len(row) > 1 else "",
+                "stopped_at": row[2].strip() if len(row) > 2 else "",
+                "reason": row[3].strip() if len(row) > 3 else "",
+            }
+        )
+    return rows
+
+
+def _add_stop_row_sync(user_id: str, reason: str) -> None:
+    worksheet = _get_stop_list_worksheet()
+    stopped_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    worksheet.append_row([user_id, "", stopped_at, reason])
+
+
+def _remove_stop_row_sync(user_id: str) -> bool:
+    worksheet = _get_stop_list_worksheet()
+    cell = worksheet.find(user_id, in_column=1)
+    if cell is None:
+        return False
+    worksheet.delete_rows(cell.row)
+    return True
+
+
+async def refresh_stop_list() -> None:
+    """停止リストのキャッシュをスプレッドシートから更新する。
+
+    接続に失敗した場合は安全側（＝AIが通常どおり応答する側）に倒し、
+    停止リストは空として扱う。
+    """
+    global stopped_users
+    try:
+        rows = await asyncio.to_thread(_fetch_stop_list_rows_sync)
+        stopped_users = {row["user_id"]: row for row in rows}
+    except Exception as e:
+        print(f"停止リストの取得に失敗しました。安全側に倒して空リストとして扱います: {e}")
+        stopped_users = {}
+
+
+async def refresh_stop_list_loop() -> None:
+    while True:
+        await refresh_stop_list()
+        await asyncio.sleep(STOP_LIST_REFRESH_INTERVAL_SECONDS)
+
+
+async def post_to_chatwork(body: str) -> None:
+    """Chatworkの指定ルームにメッセージを投稿する。"""
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
+    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, data={"body": body})
+        resp.raise_for_status()
+
+
+async def notify_chatwork_ai_stopped(user_id: str, received_text: str, reason: str) -> None:
+    """AI応答停止中のユーザーからメッセージを受信したことをChatworkに通知する。"""
+    body = (
+        build_mention_prefix()
+        + "[info][title]【AI停止中】メッセージ受信[/title]"
+        f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
+        f"[b]受信内容:[/b]\n{received_text}\n\n"
+        f"[b]停止理由:[/b]\n{reason or '（理由未設定）'}[/info]"
+    )
+    await post_to_chatwork(body)
+
+
+async def handle_stop_command(user_id: str, reason: str) -> None:
+    try:
+        await asyncio.to_thread(_add_stop_row_sync, user_id, reason)
+        await refresh_stop_list()
+        await post_to_chatwork(f"AI応答を停止しました：{user_id}")
+    except Exception as e:
+        print(f"停止コマンドの処理に失敗しました（user_id={user_id}）: {e}")
+        try:
+            await post_to_chatwork(f"AI応答の停止に失敗しました：{user_id}\nエラー: {e}")
+        except Exception as notify_error:
+            print(f"Chatwork 通知エラー: {notify_error}")
+
+
+async def handle_resume_command(user_id: str) -> None:
+    try:
+        removed = await asyncio.to_thread(_remove_stop_row_sync, user_id)
+        await refresh_stop_list()
+        if removed:
+            await post_to_chatwork(f"AI応答を再開しました：{user_id}")
+        else:
+            await post_to_chatwork(f"停止リストに {user_id} は見つかりませんでした。")
+    except Exception as e:
+        print(f"再開コマンドの処理に失敗しました（user_id={user_id}）: {e}")
+        try:
+            await post_to_chatwork(f"AI応答の再開に失敗しました：{user_id}\nエラー: {e}")
+        except Exception as notify_error:
+            print(f"Chatwork 通知エラー: {notify_error}")
+
+
+async def check_chatwork_commands() -> None:
+    """Chatworkルームの新着メッセージを取得し、停止・再開コマンドを処理する。"""
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages?force=1"
+    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        messages = resp.json()
+
+    for message in messages:
+        message_id = str(message.get("message_id", ""))
+        if not message_id or message_id in processed_chatwork_message_ids:
+            continue
+
+        body = (message.get("body") or "").strip()
+
+        stop_match = STOP_COMMAND_RE.match(body)
+        resume_match = RESUME_COMMAND_RE.match(body)
+
+        if stop_match:
+            processed_chatwork_message_ids.add(message_id)
+            target_user_id = stop_match.group(1)
+            reason = (stop_match.group(2) or "").strip()
+            await handle_stop_command(target_user_id, reason)
+        elif resume_match:
+            processed_chatwork_message_ids.add(message_id)
+            target_user_id = resume_match.group(1)
+            await handle_resume_command(target_user_id)
+
+
+async def chatwork_command_loop() -> None:
+    while True:
+        try:
+            await check_chatwork_commands()
+        except Exception as e:
+            print(f"Chatworkコマンドの確認に失敗しました: {e}")
+        await asyncio.sleep(CHATWORK_COMMAND_POLL_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_background_tasks() -> None:
+    asyncio.create_task(refresh_stop_list_loop())
+    asyncio.create_task(chatwork_command_loop())
 
 
 def build_date_notice() -> str:
@@ -282,6 +477,28 @@ async def webhook(request: Request):
 
             message = event.message
             user_id = event.source.user_id
+
+            stop_info = stopped_users.get(user_id)
+            if stop_info is not None:
+                # AI自動応答停止中：Claudeは呼ばず、LINEへの返信も行わない
+                if isinstance(message, TextMessageContent):
+                    received_text = message.text
+                elif type(message) in NON_TEXT_MESSAGE_TYPES:
+                    received_text = f"（{NON_TEXT_MESSAGE_TYPES[type(message)]}を送信）"
+                else:
+                    continue
+
+                conversation_history[user_id].append({"role": "user", "content": received_text})
+
+                try:
+                    await notify_chatwork_ai_stopped(
+                        user_id, received_text, stop_info.get("reason", "")
+                    )
+                except Exception as e:
+                    # 通知失敗はログに残すが処理自体は継続する
+                    print(f"Chatwork 通知エラー: {e}")
+
+                continue
 
             if isinstance(message, TextMessageContent):
                 user_text = message.text
