@@ -229,13 +229,58 @@ async def post_to_chatwork(body: str) -> None:
         resp.raise_for_status()
 
 
-async def notify_chatwork_ai_stopped(user_id: str, received_text: str, reason: str) -> None:
+# --- LINEプロフィール名の取得 ---------------------------------------------
+# user_id -> displayName（メモリ上のキャッシュ。サーバー再起動でリセットされる）
+line_display_name_cache: dict[str, str] = {}
+
+DISPLAY_NAME_FETCH_FAILED = "（取得失敗）"
+
+
+async def get_line_display_name(line_api: AsyncMessagingApi, user_id: str) -> str:
+    """LINEのプロフィール名を取得する。失敗時は「（取得失敗）」を返し、処理は継続する。
+
+    取得に成功した名前のみキャッシュし、失敗した場合は次回再取得を試みる。
+    """
+    cached = line_display_name_cache.get(user_id)
+    if cached is not None:
+        return cached
+
+    try:
+        profile = await line_api.get_profile(user_id)
+        display_name = profile.display_name
+    except Exception as e:
+        print(f"LINEプロフィールの取得に失敗しました（user_id={user_id}）: {e}")
+        return DISPLAY_NAME_FETCH_FAILED
+
+    line_display_name_cache[user_id] = display_name
+    return display_name
+
+
+def build_user_header(display_name: str, user_id: str) -> str:
+    """Chatwork通知に共通で付けるLINEユーザー名・IDのヘッダーを組み立てる。
+
+    USER IDは担当者が停止コマンドにコピペするため、単独の行に置く。
+    """
+    return (
+        f"[b]LINEユーザー名:[/b]\n{display_name}\n\n"
+        f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
+    )
+
+
+def build_stop_command_hint(user_id: str) -> str:
+    """通知末尾に添える停止コマンドの案内を組み立てる。"""
+    return f"\n\n※自動応答を止める場合：停止 {user_id} 理由"
+
+
+async def notify_chatwork_ai_stopped(
+    user_id: str, display_name: str, received_text: str, reason: str
+) -> None:
     """AI応答停止中のユーザーからメッセージを受信したことをChatworkに通知する。"""
     body = (
         build_mention_prefix()
         + "[info][title]【AI停止中】メッセージ受信[/title]"
-        f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
-        f"[b]受信内容:[/b]\n{received_text}\n\n"
+        + build_user_header(display_name, user_id)
+        + f"[b]受信内容:[/b]\n{received_text}\n\n"
         f"[b]停止理由:[/b]\n{reason or '（理由未設定）'}[/info]"
     )
     await post_to_chatwork(body)
@@ -426,57 +471,52 @@ def build_mention_prefix() -> str:
     return "".join(mentions) + "\n"
 
 
-async def notify_chatwork_draft(user_id: str, message_type_label: str, history: deque) -> None:
+async def notify_chatwork_draft(
+    user_id: str, display_name: str, message_type_label: str, history: deque
+) -> None:
     """画像・動画・ファイルの下書き提出を Chatwork に通知する。"""
     history_text = format_history_for_chatwork(history)
     body = (
         build_mention_prefix()
         + "[info][title]【下書き提出】確認依頼[/title]"
-        f"[b]LINEユーザーID:[/b]\n{user_id}\n\n"
-        f"[b]メッセージ種別:[/b]\n{message_type_label}\n\n"
-        f"[b]直近の会話履歴（3往復分）:[/b]\n{history_text}[/info]"
+        + build_user_header(display_name, user_id)
+        + f"[b]メッセージ種別:[/b]\n{message_type_label}\n\n"
+        f"[b]直近の会話履歴（3往復分）:[/b]\n{history_text}"
+        + build_stop_command_hint(user_id)
+        + "[/info]"
     )
-    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
-    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, data={"body": body})
-        resp.raise_for_status()
+    await post_to_chatwork(body)
 
 
-async def notify_chatwork(user_message: str, answer: str) -> None:
+async def notify_chatwork(user_id: str, display_name: str, user_message: str, answer: str) -> None:
     """Chatwork の指定ルームにエスカレーション通知を送る。"""
     body = (
         build_mention_prefix()
         + "[info][title]【要確認】エスカレーション通知[/title]"
-        f"[b]ユーザーメッセージ:[/b]\n{user_message}\n\n"
-        f"[b]AI回答:[/b]\n{answer}[/info]"
+        + build_user_header(display_name, user_id)
+        + f"[b]ユーザーメッセージ:[/b]\n{user_message}\n\n"
+        f"[b]AI回答:[/b]\n{answer}"
+        + build_stop_command_hint(user_id)
+        + "[/info]"
     )
-    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
-    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, data={"body": body})
-        resp.raise_for_status()
+    await post_to_chatwork(body)
 
 
 async def notify_chatwork_keyword_escalation(
-    user_message: str, answer: str, matched_keywords: list[str]
+    user_id: str, display_name: str, user_message: str, answer: str, matched_keywords: list[str]
 ) -> None:
     """辞退・クレーム等のキーワードを検知した際、AIの判定に関わらず Chatwork に通知する。"""
     body = (
         build_mention_prefix()
         + "[info][title]【緊急】要対応キーワード検知[/title]"
-        f"[b]検知ワード:[/b] {', '.join(matched_keywords)}\n\n"
+        + build_user_header(display_name, user_id)
+        + f"[b]検知ワード:[/b] {', '.join(matched_keywords)}\n\n"
         f"[b]ユーザーメッセージ:[/b]\n{user_message}\n\n"
-        f"[b]AI回答:[/b]\n{answer}[/info]"
+        f"[b]AI回答:[/b]\n{answer}"
+        + build_stop_command_hint(user_id)
+        + "[/info]"
     )
-    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
-    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, data={"body": body})
-        resp.raise_for_status()
+    await post_to_chatwork(body)
 
 
 async def notify_chatwork_line_failure(user_id: str, content: str, error: str) -> None:
@@ -559,9 +599,10 @@ async def webhook(request: Request):
 
                 conversation_history[user_id].append({"role": "user", "content": received_text})
 
+                display_name = await get_line_display_name(line_api, user_id)
                 try:
                     await notify_chatwork_ai_stopped(
-                        user_id, received_text, stop_info.get("reason", "")
+                        user_id, display_name, received_text, stop_info.get("reason", "")
                     )
                 except Exception as e:
                     # 通知失敗はログに残すが処理自体は継続する
@@ -583,15 +624,19 @@ async def webhook(request: Request):
                 # （キーワード検知と【要確認】の両方に該当する場合は、キーワード検知を優先し重複通知しない）
                 matched_keywords = detect_escalation_keywords(user_text)
                 needs_review = "【要確認】" in answer
+                if matched_keywords or needs_review:
+                    display_name = await get_line_display_name(line_api, user_id)
                 if matched_keywords:
                     try:
-                        await notify_chatwork_keyword_escalation(user_text, answer, matched_keywords)
+                        await notify_chatwork_keyword_escalation(
+                            user_id, display_name, user_text, answer, matched_keywords
+                        )
                     except Exception as e:
                         # 通知失敗はログに残すが LINE 返信には影響させない
                         print(f"Chatwork 通知エラー: {e}")
                 elif needs_review:
                     try:
-                        await notify_chatwork(user_text, answer)
+                        await notify_chatwork(user_id, display_name, user_text, answer)
                     except Exception as e:
                         # 通知失敗はログに残すが LINE 返信には影響させない
                         print(f"Chatwork 通知エラー: {e}")
@@ -611,9 +656,10 @@ async def webhook(request: Request):
                     {"role": "assistant", "content": DRAFT_SUBMISSION_REPLY}
                 )
 
+                display_name = await get_line_display_name(line_api, user_id)
                 try:
                     await notify_chatwork_draft(
-                        user_id, message_type_label, conversation_history[user_id]
+                        user_id, display_name, message_type_label, conversation_history[user_id]
                     )
                 except Exception as e:
                     # 通知失敗はログに残すが LINE 返信には影響させない
