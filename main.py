@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import traceback
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -107,6 +108,29 @@ processed_chatwork_message_ids: set[str] = set()
 
 STOP_COMMAND_RE = re.compile(r"^停止\s+(\S+)(?:\s+(.+))?$", re.DOTALL)
 RESUME_COMMAND_RE = re.compile(r"^再開\s+(\S+)\s*$", re.DOTALL)
+GLOBAL_STOP_COMMAND = "全停止"
+GLOBAL_RESUME_COMMAND = "全再開"
+STATUS_COMMAND = "状態"
+
+# --- 全体停止スイッチ ----------------------------------------------------
+# 全体停止の状態はスプレッドシートの「設定」シートに保存し、再起動後も維持する。
+# 1行目ヘッダー、A列:項目 / B列:値（ON/OFF） / C列:更新日時
+SETTINGS_SHEET_TITLE = "設定"
+SETTINGS_SHEET_HEADERS = ["項目", "値", "更新日時"]
+GLOBAL_STOP_SETTING_KEY = "全停止"
+
+global_stop_enabled = False
+
+# --- メッセージログ ------------------------------------------------------
+# 1行目ヘッダー、A列:受信日時 / B列:LINE USER ID / C列:LINEプロフィール名 / D列:受信内容 / E列:AI応答の有無
+MESSAGE_LOG_SHEET_TITLE = "メッセージログ"
+MESSAGE_LOG_SHEET_HEADERS = ["受信日時", "LINE USER ID", "LINEプロフィール名", "受信内容", "AI応答の有無"]
+LOG_STATUS_RESPONDED = "応答"
+LOG_STATUS_STOPPED = "停止中"
+LOG_STATUS_ERROR = "エラー"
+
+# create_task したログ書き込みタスクがGCされないよう参照を保持する
+_background_tasks: set[asyncio.Task] = set()
 
 _gspread_client = None
 
@@ -126,6 +150,84 @@ def _get_gspread_client():
 def _get_stop_list_worksheet():
     client = _get_gspread_client()
     return client.open_by_key(SPREADSHEET_ID).sheet1
+
+
+# シート名 -> Worksheet（API呼び出し回数を抑えるためキャッシュする）
+_worksheet_cache: dict[str, gspread.Worksheet] = {}
+
+
+def _get_or_create_worksheet_sync(title: str, headers: list[str]) -> gspread.Worksheet:
+    """停止リストと同じスプレッドシート内のシートを取得し、無ければヘッダー付きで作成する。"""
+    cached = _worksheet_cache.get(title)
+    if cached is not None:
+        return cached
+
+    spreadsheet = _get_gspread_client().open_by_key(SPREADSHEET_ID)
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+        worksheet.append_row(headers)
+
+    _worksheet_cache[title] = worksheet
+    return worksheet
+
+
+def _get_settings_worksheet() -> gspread.Worksheet:
+    return _get_or_create_worksheet_sync(SETTINGS_SHEET_TITLE, SETTINGS_SHEET_HEADERS)
+
+
+def _fetch_global_stop_sync() -> bool:
+    """設定シートから全体停止の状態を取得する（ブロッキング処理）。"""
+    worksheet = _get_settings_worksheet()
+    for row in worksheet.get_all_values()[1:]:
+        if row and row[0].strip() == GLOBAL_STOP_SETTING_KEY:
+            return len(row) > 1 and row[1].strip().upper() == "ON"
+    return False
+
+
+def _set_global_stop_sync(enabled: bool) -> None:
+    """設定シートに全体停止の状態を書き込む（ブロッキング処理）。"""
+    worksheet = _get_settings_worksheet()
+    value = "ON" if enabled else "OFF"
+    updated_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+    cell = worksheet.find(GLOBAL_STOP_SETTING_KEY, in_column=1)
+    if cell is not None:
+        worksheet.update([[value, updated_at]], f"B{cell.row}:C{cell.row}")
+    else:
+        worksheet.append_row([GLOBAL_STOP_SETTING_KEY, value, updated_at])
+
+
+def _append_message_log_sync(row: list[str]) -> None:
+    worksheet = _get_or_create_worksheet_sync(MESSAGE_LOG_SHEET_TITLE, MESSAGE_LOG_SHEET_HEADERS)
+    worksheet.append_row(row, value_input_option="RAW")
+
+
+async def _write_message_log(
+    received_at: str, user_id: str, display_name: str, received_text: str, status: str
+) -> None:
+    try:
+        await asyncio.to_thread(
+            _append_message_log_sync, [received_at, user_id, display_name, received_text, status]
+        )
+    except Exception as e:
+        # 書き込み失敗はログに残すのみ。次回はシートを取り直す
+        _worksheet_cache.pop(MESSAGE_LOG_SHEET_TITLE, None)
+        print(f"メッセージログの書き込みに失敗しました（user_id={user_id}）: {e}")
+
+
+def log_message(user_id: str, display_name: str, received_text: str, status: str) -> None:
+    """受信メッセージをメッセージログシートに記録する。
+
+    LINE返信やChatwork通知を遅らせないよう、バックグラウンドで書き込む。
+    """
+    received_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    task = asyncio.create_task(
+        _write_message_log(received_at, user_id, display_name, received_text, status)
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _fetch_stop_list_rows_sync() -> list[dict]:
@@ -213,9 +315,23 @@ async def refresh_stop_list() -> None:
         stopped_users = {}
 
 
+async def refresh_global_stop() -> None:
+    """全体停止の状態をスプレッドシートから更新する。
+
+    取得に失敗した場合は直前の状態を維持する（全停止中に通信エラーで勝手に再開しないため）。
+    """
+    global global_stop_enabled
+    try:
+        global_stop_enabled = await asyncio.to_thread(_fetch_global_stop_sync)
+    except Exception as e:
+        _worksheet_cache.pop(SETTINGS_SHEET_TITLE, None)
+        print(f"全体停止状態の取得に失敗しました。直前の状態を維持します: {e}")
+
+
 async def refresh_stop_list_loop() -> None:
     while True:
         await refresh_stop_list()
+        await refresh_global_stop()
         await asyncio.sleep(STOP_LIST_REFRESH_INTERVAL_SECONDS)
 
 
@@ -318,8 +434,43 @@ async def handle_resume_command(user_id: str) -> None:
             print(f"Chatwork 通知エラー: {notify_error}")
 
 
+async def handle_global_stop_command(enabled: bool) -> None:
+    global global_stop_enabled
+    action = "全停止" if enabled else "全再開"
+    try:
+        await asyncio.to_thread(_set_global_stop_sync, enabled)
+        global_stop_enabled = enabled
+        if enabled:
+            await post_to_chatwork(
+                "全ユーザーへのAI自動応答を停止しました。\n解除する場合：全再開"
+            )
+        else:
+            await post_to_chatwork("全ユーザーへのAI自動応答を再開しました。")
+    except Exception as e:
+        _worksheet_cache.pop(SETTINGS_SHEET_TITLE, None)
+        print(f"{action}コマンドの処理に失敗しました: {e}")
+        try:
+            await post_to_chatwork(f"{action}に失敗しました。\nエラー: {e}")
+        except Exception as notify_error:
+            print(f"Chatwork 通知エラー: {notify_error}")
+
+
+async def handle_status_command() -> None:
+    await refresh_stop_list()
+    await refresh_global_stop()
+    global_status = "全停止中" if global_stop_enabled else "稼働中（全停止はしていません）"
+    try:
+        await post_to_chatwork(
+            "[info][title]現在の状態[/title]"
+            f"全体: {global_status}\n"
+            f"個別停止者数: {len(stopped_users)}人[/info]"
+        )
+    except Exception as e:
+        print(f"Chatwork 通知エラー: {e}")
+
+
 async def check_chatwork_commands() -> None:
-    """Chatworkルームの新着メッセージを取得し、停止・再開コマンドを処理する。"""
+    """Chatworkルームの新着メッセージを取得し、停止・再開・全停止・全再開・状態コマンドを処理する。"""
     url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages?force=1"
     headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
 
@@ -338,7 +489,16 @@ async def check_chatwork_commands() -> None:
         stop_match = STOP_COMMAND_RE.match(body)
         resume_match = RESUME_COMMAND_RE.match(body)
 
-        if stop_match:
+        if body == GLOBAL_STOP_COMMAND:
+            processed_chatwork_message_ids.add(message_id)
+            await handle_global_stop_command(True)
+        elif body == GLOBAL_RESUME_COMMAND:
+            processed_chatwork_message_ids.add(message_id)
+            await handle_global_stop_command(False)
+        elif body == STATUS_COMMAND:
+            processed_chatwork_message_ids.add(message_id)
+            await handle_status_command()
+        elif stop_match:
             processed_chatwork_message_ids.add(message_id)
             target_user_id = stop_match.group(1)
             reason = (stop_match.group(2) or "").strip()
@@ -388,6 +548,7 @@ async def start_background_tasks() -> None:
     except Exception as e:
         print(f"停止リストの重複行整理に失敗しました: {e}")
 
+    await refresh_global_stop()
     await seed_processed_chatwork_message_ids()
 
     asyncio.create_task(refresh_stop_list_loop())
@@ -519,6 +680,53 @@ async def notify_chatwork_keyword_escalation(
     await post_to_chatwork(body)
 
 
+async def notify_chatwork_global_stopped(
+    user_id: str, display_name: str, received_text: str
+) -> None:
+    """全体停止中にメッセージを受信したことをChatworkに通知する。"""
+    body = (
+        build_mention_prefix()
+        + "[info][title]【全停止中】メッセージ受信[/title]"
+        + build_user_header(display_name, user_id)
+        + f"[b]受信内容:[/b]\n{received_text}\n\n"
+        "※全停止中のためAIは返信していません。解除する場合：全再開[/info]"
+    )
+    await post_to_chatwork(body)
+
+
+def summarize_error(error: Exception, max_length: int = 300) -> str:
+    """Chatwork通知用に例外を1行の要約にする（詳細はログにのみ出力する）。"""
+    summary = f"{type(error).__name__}: {error}".replace("\n", " ")
+    if len(summary) > max_length:
+        summary = summary[:max_length] + "…"
+    return summary
+
+
+async def notify_chatwork_claude_failure(
+    user_id: str,
+    display_name: str,
+    received_text: str,
+    error_summary: str,
+    matched_keywords: list[str],
+) -> None:
+    """Claude APIの呼び出しに失敗した場合に Chatwork へ通知する（LINEには返信しない）。"""
+    keyword_line = (
+        f"[b]検知ワード:[/b] {', '.join(matched_keywords)}\n\n" if matched_keywords else ""
+    )
+    body = (
+        build_mention_prefix()
+        + "[info][title]【システムエラー】応答失敗[/title]"
+        + build_user_header(display_name, user_id)
+        + keyword_line
+        + f"[b]受信メッセージ:[/b]\n{received_text}\n\n"
+        f"[b]エラー内容:[/b]\n{error_summary}\n\n"
+        "※LINEには返信していません。必要に応じて手動で対応してください。"
+        + build_stop_command_hint(user_id)
+        + "[/info]"
+    )
+    await post_to_chatwork(body)
+
+
 async def notify_chatwork_line_failure(user_id: str, content: str, error: str) -> None:
     """LINE送信が失敗した場合に Chatwork へ通知する。"""
     body = (
@@ -587,19 +795,30 @@ async def webhook(request: Request):
             message = event.message
             user_id = event.source.user_id
 
+            if isinstance(message, TextMessageContent):
+                received_text = message.text
+            elif type(message) in NON_TEXT_MESSAGE_TYPES:
+                received_text = f"（{NON_TEXT_MESSAGE_TYPES[type(message)]}を送信）"
+            else:
+                continue
+
+            display_name = await get_line_display_name(line_api, user_id)
+
+            if global_stop_enabled:
+                # 全体停止中：Claudeは呼ばず、LINEへの返信も一切行わない
+                conversation_history[user_id].append({"role": "user", "content": received_text})
+                try:
+                    await notify_chatwork_global_stopped(user_id, display_name, received_text)
+                except Exception as e:
+                    print(f"Chatwork 通知エラー: {e}")
+                log_message(user_id, display_name, received_text, LOG_STATUS_STOPPED)
+                continue
+
             stop_info = stopped_users.get(user_id)
             if stop_info is not None:
                 # AI自動応答停止中：Claudeは呼ばず、LINEへの返信も行わない
-                if isinstance(message, TextMessageContent):
-                    received_text = message.text
-                elif type(message) in NON_TEXT_MESSAGE_TYPES:
-                    received_text = f"（{NON_TEXT_MESSAGE_TYPES[type(message)]}を送信）"
-                else:
-                    continue
-
                 conversation_history[user_id].append({"role": "user", "content": received_text})
 
-                display_name = await get_line_display_name(line_api, user_id)
                 try:
                     await notify_chatwork_ai_stopped(
                         user_id, display_name, received_text, stop_info.get("reason", "")
@@ -608,24 +827,33 @@ async def webhook(request: Request):
                     # 通知失敗はログに残すが処理自体は継続する
                     print(f"Chatwork 通知エラー: {e}")
 
+                log_message(user_id, display_name, received_text, LOG_STATUS_STOPPED)
                 continue
 
             if isinstance(message, TextMessageContent):
                 user_text = message.text
+                matched_keywords = detect_escalation_keywords(user_text)
 
                 try:
                     answer = await call_claude(user_id, user_text)
                     conversation_history[user_id].append({"role": "user", "content": user_text})
                     conversation_history[user_id].append({"role": "assistant", "content": answer})
                 except Exception as e:
-                    answer = f"申し訳ありません、エラーが発生しました。\n{e}"
+                    # API失敗時はLINEへ一切返信しない。詳細はログのみに出し、Chatworkには要約を通知する
+                    print(f"Claude API 呼び出し失敗（user_id={user_id}）: {e}")
+                    traceback.print_exc()
+                    try:
+                        await notify_chatwork_claude_failure(
+                            user_id, display_name, user_text, summarize_error(e), matched_keywords
+                        )
+                    except Exception as notify_error:
+                        print(f"Chatwork 通知エラー: {notify_error}")
+                    log_message(user_id, display_name, received_text, LOG_STATUS_ERROR)
+                    continue
 
                 # 辞退・クレーム等のキーワードを検知した場合は、AIの判定に関わらず必ず通知する
                 # （キーワード検知と【要確認】の両方に該当する場合は、キーワード検知を優先し重複通知しない）
-                matched_keywords = detect_escalation_keywords(user_text)
                 needs_review = "【要確認】" in answer
-                if matched_keywords or needs_review:
-                    display_name = await get_line_display_name(line_api, user_id)
                 if matched_keywords:
                     try:
                         await notify_chatwork_keyword_escalation(
@@ -644,19 +872,18 @@ async def webhook(request: Request):
                 # LINE ユーザーに返信（【要確認】タグは除去して送る）
                 line_answer = answer.replace("【要確認】", "").strip()
                 await send_line_reply(line_api, event.reply_token, user_id, line_answer)
+                log_message(user_id, display_name, received_text, LOG_STATUS_RESPONDED)
 
             elif type(message) in NON_TEXT_MESSAGE_TYPES:
                 # 画像・動画・ファイル：Claude API は呼ばず、固定文で返信し、必ず Chatwork に通知する
                 message_type_label = NON_TEXT_MESSAGE_TYPES[type(message)]
-                marker_text = f"（{message_type_label}を送信）"
 
                 # 文脈が途切れないよう会話履歴にも記録する
-                conversation_history[user_id].append({"role": "user", "content": marker_text})
+                conversation_history[user_id].append({"role": "user", "content": received_text})
                 conversation_history[user_id].append(
                     {"role": "assistant", "content": DRAFT_SUBMISSION_REPLY}
                 )
 
-                display_name = await get_line_display_name(line_api, user_id)
                 try:
                     await notify_chatwork_draft(
                         user_id, display_name, message_type_label, conversation_history[user_id]
@@ -666,9 +893,7 @@ async def webhook(request: Request):
                     print(f"Chatwork 通知エラー: {e}")
 
                 await send_line_reply(line_api, event.reply_token, user_id, DRAFT_SUBMISSION_REPLY)
-
-            else:
-                continue
+                log_message(user_id, display_name, received_text, LOG_STATUS_RESPONDED)
 
     return JSONResponse(content={"status": "ok"})
 
